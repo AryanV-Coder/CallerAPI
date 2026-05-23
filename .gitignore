@@ -1,0 +1,8 @@
+__pycache__/
+venv/
+*.env
+*.DS_Store
+node_modules/
+dist/
+audio_files/
+.agents/

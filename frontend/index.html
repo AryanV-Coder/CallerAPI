@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Caller API — Playground</title>
+    <meta name="description" content="General-purpose AI voice calling API playground. Make calls, view transcripts, and analyze sentiment.">
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📞</text></svg>">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">📞</span>
+                <h1>Caller API</h1>
+            </div>
+            <span class="badge">Playground</span>
+        </header>
+
+        <!-- Tab Bar -->
+        <div class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('make-call-tab')">Make Call</button>
+            <button class="tab-btn" onclick="switchTab('call-result-tab')">Call Result</button>
+        </div>
+
+        <!-- Make Call Tab -->
+        <div id="make-call-tab" class="tab-content active">
+            <div class="card">
+                <h2>Initiate a Call</h2>
+                <p class="card-subtitle">Configure the AI persona and make an outbound voice call.</p>
+
+                <div class="form-group">
+                    <label for="phone">Phone Number <span class="required">*</span></label>
+                    <input type="tel" id="phone" placeholder="+919876543210">
+                    <span class="hint">Full E.164 format with country code</span>
+                </div>
+
+                <div class="form-group">
+                    <label for="system_prompt">System Prompt <span class="required">*</span></label>
+                    <textarea id="system_prompt" rows="4" placeholder="You are a friendly appointment reminder assistant for Dr. Sharma's clinic. Be polite, concise, and professional."></textarea>
+                    <span class="hint">Defines the AI persona and behavior</span>
+                </div>
+
+                <div class="form-group">
+                    <label for="context">Context</label>
+                    <textarea id="context" rows="3" placeholder="Patient: Rahul Verma&#10;Appointment: 25 May, 3:00 PM&#10;Doctor: Dr. Sharma"></textarea>
+                    <span class="hint">Domain-specific data the AI should reference</span>
+                </div>
+
+                <div class="form-group">
+                    <label for="first_message">First Message</label>
+                    <textarea id="first_message" rows="2" placeholder="Hello Rahul, this is a reminder about your appointment tomorrow at 3 PM."></textarea>
+                    <span class="hint">Leave empty to let the AI generate the greeting</span>
+                </div>
+
+                <div class="collapsible-section">
+                    <button class="collapsible-toggle" onclick="toggleAdvanced()">
+                        <span id="advanced-icon">▶</span> Advanced Options
+                    </button>
+                    <div id="advanced-options" class="collapsible-content">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="language">Language</label>
+                                <select id="language">
+                                    <option value="en-IN">English (India)</option>
+                                    <option value="hi-IN">Hindi</option>
+                                    <option value="bn-IN">Bengali</option>
+                                    <option value="ta-IN">Tamil</option>
+                                    <option value="te-IN">Telugu</option>
+                                    <option value="mr-IN">Marathi</option>
+                                    <option value="gu-IN">Gujarati</option>
+                                    <option value="kn-IN">Kannada</option>
+                                    <option value="ml-IN">Malayalam</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="speaker">Voice</label>
+                                <select id="speaker">
+                                    <option value="shubh">Shubh (Male)</option>
+                                    <option value="advika">Advika (Female)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="webhook_url">Webhook URL</label>
+                            <input type="url" id="webhook_url" placeholder="https://your-n8n.com/webhook/abc123">
+                            <span class="hint">Receives full call result (summary + transcript) when call ends</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="action-area">
+                    <button id="make-call-btn" class="primary-btn">
+                        <span class="btn-icon">📞</span> Make Call
+                    </button>
+                </div>
+
+                <!-- Call ID display (shown after successful call) -->
+                <div id="call-id-display" class="call-id-display hidden">
+                    <div class="call-id-label">Call ID</div>
+                    <div class="call-id-value">
+                        <code id="call-id-text"></code>
+                        <button class="copy-btn" onclick="copyCallId()">Copy</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Call Result Tab -->
+        <div id="call-result-tab" class="tab-content">
+            <div class="card">
+                <h2>Call Result</h2>
+                <p class="card-subtitle">Look up the result of a completed call.</p>
+
+                <div class="form-group">
+                    <label for="lookup-call-id">Call ID</label>
+                    <div class="input-with-btn">
+                        <input type="text" id="lookup-call-id" placeholder="CA1234abcd5678efgh...">
+                        <button id="lookup-btn" class="secondary-btn">Look Up</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Result display (shown after lookup) -->
+            <div id="result-container" class="hidden">
+                <div class="result-header">
+                    <div class="result-meta">
+                        <span id="result-status" class="status-badge">—</span>
+                        <span id="result-duration" class="duration-text"></span>
+                    </div>
+                    <div id="result-sentiment-badge" class="sentiment-badge">—</div>
+                </div>
+
+                <div class="card result-card">
+                    <h3>Summary</h3>
+                    <p id="result-summary" class="result-text">—</p>
+                </div>
+
+                <div class="card result-card">
+                    <h3>Sentiment</h3>
+                    <p id="result-sentiment-detail" class="result-text">—</p>
+                </div>
+
+                <div class="card result-card">
+                    <h3>Transcript</h3>
+                    <div id="result-transcript" class="transcript-container">
+                        <p class="result-text muted">No transcript available.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toast Notification -->
+        <div id="toast" class="toast"></div>
+    </div>
+
+    <script type="module" src="/script.js"></script>
+</body>
+</html>

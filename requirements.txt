@@ -1,0 +1,13 @@
+twilio
+python-dotenv
+sarvamai
+groq
+fastapi
+uvicorn
+requests
+python-multipart
+numpy<2
+torch
+torchaudio
+silero-vad
+httpx
