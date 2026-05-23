@@ -19,6 +19,9 @@ def make_call(phone_number: str) -> str:
         to=phone_number,
         from_=config.TWILIO_PHONE_NUMBER,
         url=f"{config.SERVER_URL}/voice",
+        status_callback=f"{config.SERVER_URL}/call-status",
+        status_callback_event=["completed"],
+        status_callback_method="POST",
     )
     print(f"✅ [Twilio] Call initiated to {phone_number} | SID: {call.sid}")
     return call.sid
