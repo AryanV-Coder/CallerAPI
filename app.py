@@ -4,7 +4,9 @@ import asyncio
 import base64
 import time
 import tempfile
+import traceback
 import httpx
+from functools import partial
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -159,6 +161,7 @@ async def media_stream(websocket: WebSocket):
     barge_in_detector = BargeInDetector()
     cancel_event = asyncio.Event()
     webhook_url = ""
+    finalized = False  # Guard: ensure we finalize exactly once
 
     try:
         async for raw_message in websocket.iter_text():
@@ -183,6 +186,7 @@ async def media_stream(websocket: WebSocket):
                 # Extract webhook URL from context
                 ctx = call_contexts.get(call_sid, {})
                 webhook_url = ctx.get("webhook_url", "")
+                print(f"🔗 Webhook URL for this call: {webhook_url or '(none)'}")
 
                 # --- Bot Speaks First ---
                 cancel_event = asyncio.Event()
@@ -230,22 +234,19 @@ async def media_stream(websocket: WebSocket):
                     barge_in_detector.reset()
 
             elif event == "stop":
-                print("⏹ Stream stopped")
-
-                # Generate summary + sentiment and fire webhook
-                asyncio.create_task(
-                    _finalize_call(call_sid, webhook_url)
-                )
+                print("⏹ Stream stopped — finalizing call...")
                 break
 
     except Exception as e:
         print(f"🔥 WebSocket error: {e}")
-        # Still try to finalize the call on error
-        if call_sid:
-            asyncio.create_task(
-                _finalize_call(call_sid, webhook_url)
-            )
+        traceback.print_exc()
+
     finally:
+        # Always finalize here — guaranteed to run exactly once
+        if call_sid and not finalized:
+            finalized = True
+            print(f"🔧 Finalizing call {call_sid} (webhook={bool(webhook_url)})")
+            await _finalize_call(call_sid, webhook_url)
         print("🔌 WebSocket disconnected")
 
 
@@ -436,13 +437,16 @@ async def _finalize_call(call_sid: str, webhook_url: str):
     """
     After a call ends:
     1. Calculate duration
-    2. Generate summary + sentiment via LLM
+    2. Generate summary + sentiment via LLM (in thread to avoid blocking)
     3. Store result in call_results
-    4. POST to webhook_url if provided
+    4. POST to webhook_url if provided (with retries)
     5. Clean up in-memory state
     """
     if not call_sid or call_sid == "unknown":
+        print(f"⚠ _finalize_call skipped: call_sid={call_sid}")
         return
+
+    print(f"🔧 _finalize_call START for {call_sid}")
 
     try:
         # Calculate duration
@@ -460,9 +464,15 @@ async def _finalize_call(call_sid: str, webhook_url: str):
         ]
 
         # Generate summary + sentiment
+        # Run in thread executor because summarize_call() uses the
+        # synchronous Groq SDK which blocks the event loop.
         if len(transcript) > 0:
             print(f"📊 Generating call summary for {call_sid}...")
-            analysis = summarize_call(history)
+            loop = asyncio.get_running_loop()
+            analysis = await loop.run_in_executor(
+                None, partial(summarize_call, history)
+            )
+            print(f"📊 Summary generated for {call_sid}")
         else:
             analysis = {
                 "summary": "The call ended without any conversation.",
@@ -486,10 +496,15 @@ async def _finalize_call(call_sid: str, webhook_url: str):
         # POST to webhook if provided (for n8n integration)
         if webhook_url:
             await _send_webhook(call_sid, result, webhook_url)
+        else:
+            print(f"ℹ No webhook_url for {call_sid} — result stored in memory only")
 
     except Exception as e:
         print(f"🔥 Error finalizing call {call_sid}: {e}")
-        call_results[call_sid] = {
+        traceback.print_exc()
+
+        # Store a fallback result so GET /call/{id} still works
+        fallback_result = {
             "status": "completed",
             "summary": "Summary generation failed.",
             "user_sentiment": "neutral",
@@ -497,23 +512,48 @@ async def _finalize_call(call_sid: str, webhook_url: str):
             "transcript": [],
             "duration_seconds": 0,
         }
+        call_results[call_sid] = fallback_result
+
+        # Still attempt to deliver the webhook with the fallback result
+        if webhook_url:
+            print(f"🔧 Sending fallback result to webhook for {call_sid}")
+            await _send_webhook(call_sid, fallback_result, webhook_url)
 
     finally:
         # Clean up conversation history (keep results for GET /call/{id})
         call_histories.pop(call_sid, None)
         call_contexts.pop(call_sid, None)
+        print(f"🧹 Cleaned up in-memory state for {call_sid}")
 
 
 async def _send_webhook(call_id: str, result: dict, webhook_url: str):
-    """POST the full call result to the webhook URL (e.g. n8n Webhook node)."""
+    """
+    POST the full call result to the webhook URL (e.g. n8n Webhook node).
+    Retries up to 3 times with exponential backoff.
+    """
     payload = {"call_id": call_id, **result}
+    max_retries = 3
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(webhook_url, json=payload)
-            print(f"✅ Webhook sent to {webhook_url} | Status: {response.status_code}")
-    except Exception as e:
-        print(f"❌ Webhook delivery failed ({webhook_url}): {e}")
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    webhook_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                print(f"✅ Webhook delivered to {webhook_url} | Status: {response.status_code} | Attempt: {attempt}")
+                return  # Success — exit immediately
+
+        except Exception as e:
+            print(f"❌ Webhook attempt {attempt}/{max_retries} failed ({webhook_url}): {e}")
+            if attempt < max_retries:
+                wait = 2 ** attempt  # 2s, 4s
+                print(f"   ⏳ Retrying in {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                print(f"🚨 Webhook delivery FAILED after {max_retries} attempts for call {call_id}")
+                traceback.print_exc()
 
 
 # ─── Audio Serving (fallback) ────────────────────────────────────────────
