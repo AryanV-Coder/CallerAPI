@@ -48,10 +48,6 @@ call_results: dict[str, dict] = {}
 # Call start times for duration tracking
 call_start_times: dict[str, float] = {}
 
-# Track which calls have been finalized (prevents double-finalization
-# between the WebSocket handler and the /call-status callback)
-finalized_calls: set[str] = set()
-
 
 # ─── Request/Response Models ─────────────────────────────────────────────
 
@@ -138,75 +134,41 @@ async def voice_webhook():
     return Response(content=twiml, media_type="application/xml")
 
 
-# ─── Twilio Status Callback (Reliable Fallback) ─────────────────────────
+# ─── Twilio Status Callback ─── THE ONLY PLACE THAT FIRES THE WEBHOOK ───
 
 
 @app.post("/call-status")
 async def call_status_callback(request: Request):
     """
-    Twilio calls this when the call status changes to 'completed'.
+    Twilio calls this when the call ends (status = 'completed').
 
-    This is the RELIABLE fallback for webhook delivery. If the WebSocket
-    stream closed before the 'start' event (call unanswered, instant hangup,
-    voicemail drop, etc.), the WebSocket handler cannot finalize because
-    call_sid was never set. But Twilio ALWAYS fires this callback.
+    This is the ONLY place where we generate the summary and fire the
+    webhook. It's a regular HTTP POST — not tied to the WebSocket lifecycle
+    — so it always runs to completion.
     """
     form = await request.form()
     call_sid = form.get("CallSid", "")
     call_status = form.get("CallStatus", "")
-    call_duration = form.get("CallDuration", "0")  # Twilio provides this
+    call_duration = form.get("CallDuration", "0")
 
     print(f"📲 [StatusCallback] CallSid={call_sid} Status={call_status} Duration={call_duration}s")
 
     if not call_sid:
         return Response(content="ok", media_type="text/plain")
 
-    # Check if already finalized by the WebSocket handler
-    if call_sid in finalized_calls:
-        print(f"ℹ [StatusCallback] Call {call_sid} already finalized by WebSocket handler — skipping")
+    # Skip if already completed (e.g. duplicate callback)
+    if call_sid in call_results and call_results[call_sid].get("status") == "completed":
+        print(f"ℹ [StatusCallback] Call {call_sid} already completed — skipping")
         return Response(content="ok", media_type="text/plain")
 
-    # This call was NOT finalized by the WebSocket handler.
-    # This happens when:
-    #   - Call wasn't answered
-    #   - Call answered but WebSocket closed before 'start' event
-    #   - Any other stream failure
-    print(f"🔧 [StatusCallback] Finalizing call {call_sid} (WebSocket handler did not finalize this call)")
-
-    # Look up the webhook URL from the stored context
+    # Look up webhook URL
     ctx = call_contexts.get(call_sid, {})
     webhook_url = ctx.get("webhook_url", "")
 
-    # If there's no transcript (call never streamed), build a minimal result
-    if call_sid not in call_results or call_results[call_sid].get("status") in ("initiated", "in_progress"):
-        result = {
-            "status": "completed",
-            "summary": f"Call ended with status: {call_status}. No conversation was recorded.",
-            "user_sentiment": "neutral",
-            "sentiment_detail": "No conversation took place.",
-            "transcript": [],
-            "duration_seconds": int(call_duration),
-        }
-        call_results[call_sid] = result
-        finalized_calls.add(call_sid)
+    print(f"🔧 [StatusCallback] Finalizing call {call_sid} | webhook={bool(webhook_url)}")
 
-        print(f"✅ [StatusCallback] Call {call_sid} finalized | Status: {call_status} | Duration: {call_duration}s")
-
-        # Fire webhook
-        if webhook_url:
-            await _send_webhook(call_sid, result, webhook_url)
-        else:
-            print(f"ℹ [StatusCallback] No webhook_url for {call_sid}")
-    else:
-        # Result exists and is already 'completed' — just fire the webhook if needed
-        result = call_results[call_sid]
-        finalized_calls.add(call_sid)
-        if webhook_url and result.get("status") == "completed":
-            await _send_webhook(call_sid, result, webhook_url)
-
-    # Cleanup
-    call_contexts.pop(call_sid, None)
-    call_histories.pop(call_sid, None)
+    # Run full finalization: summary + webhook + cleanup
+    await _finalize_call(call_sid, webhook_url, int(call_duration))
 
     return Response(content="ok", media_type="text/plain")
 
@@ -318,21 +280,7 @@ async def media_stream(websocket: WebSocket):
         traceback.print_exc()
 
     finally:
-        # Finalize the call. Use asyncio.shield() to protect _finalize_call
-        # from being cancelled when the ASGI server tears down the WebSocket.
-        if call_sid and call_sid not in finalized_calls:
-            print(f"🔧 [WS] Finalizing call {call_sid} (webhook={bool(webhook_url)})")
-            try:
-                await asyncio.shield(_finalize_call(call_sid, webhook_url))
-            except asyncio.CancelledError:
-                print(f"⚠ [WS] Finalization task was cancelled for {call_sid}. /call-status will handle it.")
-            except Exception as e:
-                print(f"🔥 [WS] Finalization failed for {call_sid}: {e}")
-        elif call_sid and call_sid in finalized_calls:
-            print(f"ℹ [WS] Call {call_sid} already finalized — skipping")
-        elif not call_sid:
-            print("⚠ [WS] No call_sid — WebSocket closed before 'start' event. /call-status will handle finalization.")
-        print("🔌 WebSocket disconnected")
+        print(f"🔌 WebSocket disconnected (call_sid={call_sid}). /call-status will handle finalization.")
 
 
 # ─── Bot Greeting ────────────────────────────────────────────────────────
@@ -518,14 +466,10 @@ async def _process_utterance(
 # ─── Call Finalization ───────────────────────────────────────────────────
 
 
-async def _finalize_call(call_sid: str, webhook_url: str):
+async def _finalize_call(call_sid: str, webhook_url: str, twilio_duration: int = 0):
     """
-    After a call ends:
-    1. Calculate duration
-    2. Generate summary + sentiment via LLM (in thread to avoid blocking)
-    3. Store result in call_results
-    4. POST to webhook_url if provided (with retries)
-    5. Clean up in-memory state
+    Generate summary + sentiment, store result, fire webhook, clean up.
+    Called ONLY from /call-status (a normal HTTP handler that always completes).
     """
     if not call_sid or call_sid == "unknown":
         print(f"⚠ _finalize_call skipped: call_sid={call_sid}")
@@ -534,9 +478,9 @@ async def _finalize_call(call_sid: str, webhook_url: str):
     print(f"🔧 _finalize_call START for {call_sid}")
 
     try:
-        # Calculate duration
+        # Calculate duration (prefer our own timer, fallback to Twilio's)
         start_time = call_start_times.pop(call_sid, None)
-        duration = int(time.time() - start_time) if start_time else 0
+        duration = int(time.time() - start_time) if start_time else twilio_duration
 
         # Get the conversation transcript
         history = call_histories.get(call_sid, [])
@@ -549,8 +493,6 @@ async def _finalize_call(call_sid: str, webhook_url: str):
         ]
 
         # Generate summary + sentiment
-        # Run in thread executor because summarize_call() uses the
-        # synchronous Groq SDK which blocks the event loop.
         if len(transcript) > 0:
             print(f"📊 Generating call summary for {call_sid}...")
             loop = asyncio.get_running_loop()
@@ -575,46 +517,31 @@ async def _finalize_call(call_sid: str, webhook_url: str):
             "duration_seconds": duration,
         }
         call_results[call_sid] = result
-
         print(f"✅ Call {call_sid} finalized | Duration: {duration}s | Sentiment: {analysis['user_sentiment']}")
 
-        # Mark as finalized BEFORE webhook delivery so StatusCallback doesn't duplicate
-        finalized_calls.add(call_sid)
-
-        # POST to webhook if provided (for n8n integration)
-        if webhook_url:
-            await _send_webhook(call_sid, result, webhook_url)
-        else:
-            print(f"ℹ No webhook_url for {call_sid} — result stored in memory only")
-
     except Exception as e:
-        print(f"🔥 Error finalizing call {call_sid}: {e}")
+        print(f"🔥 Error generating summary for {call_sid}: {e}")
         traceback.print_exc()
-
-        # Store a fallback result so GET /call/{id} still works
-        fallback_result = {
+        result = {
             "status": "completed",
             "summary": "Summary generation failed.",
             "user_sentiment": "neutral",
             "sentiment_detail": "Error during analysis.",
             "transcript": [],
-            "duration_seconds": 0,
+            "duration_seconds": twilio_duration,
         }
-        call_results[call_sid] = fallback_result
+        call_results[call_sid] = result
 
-        # Still attempt to deliver the webhook with the fallback result
-        if webhook_url:
-            print(f"🔧 Sending fallback result to webhook for {call_sid}")
-            await _send_webhook(call_sid, fallback_result, webhook_url)
+    # Fire webhook (outside try/except so it always runs)
+    if webhook_url:
+        await _send_webhook(call_sid, result, webhook_url)
+    else:
+        print(f"ℹ No webhook_url for {call_sid}")
 
-        # Mark as finalized even on error (we attempted webhook delivery)
-        finalized_calls.add(call_sid)
-
-    finally:
-        # Clean up conversation history (keep results for GET /call/{id})
-        call_histories.pop(call_sid, None)
-        call_contexts.pop(call_sid, None)
-        print(f"🧹 Cleaned up in-memory state for {call_sid}")
+    # Cleanup
+    call_histories.pop(call_sid, None)
+    call_contexts.pop(call_sid, None)
+    print(f"🧹 Cleaned up in-memory state for {call_sid}")
 
 
 async def _send_webhook(call_id: str, result: dict, webhook_url: str):
