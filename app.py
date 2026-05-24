@@ -318,11 +318,18 @@ async def media_stream(websocket: WebSocket):
         traceback.print_exc()
 
     finally:
-        # Finalize if the WebSocket handler got a call_sid and it hasn't been finalized yet
+        # Finalize the call. Use asyncio.shield() to protect _finalize_call
+        # from being cancelled when the ASGI server tears down the WebSocket.
         if call_sid and call_sid not in finalized_calls:
-            finalized_calls.add(call_sid)
             print(f"🔧 [WS] Finalizing call {call_sid} (webhook={bool(webhook_url)})")
-            await _finalize_call(call_sid, webhook_url)
+            try:
+                await asyncio.shield(_finalize_call(call_sid, webhook_url))
+            except asyncio.CancelledError:
+                print(f"⚠ [WS] Finalization task was cancelled for {call_sid}. /call-status will handle it.")
+            except Exception as e:
+                print(f"🔥 [WS] Finalization failed for {call_sid}: {e}")
+        elif call_sid and call_sid in finalized_calls:
+            print(f"ℹ [WS] Call {call_sid} already finalized — skipping")
         elif not call_sid:
             print("⚠ [WS] No call_sid — WebSocket closed before 'start' event. /call-status will handle finalization.")
         print("🔌 WebSocket disconnected")
@@ -571,6 +578,9 @@ async def _finalize_call(call_sid: str, webhook_url: str):
 
         print(f"✅ Call {call_sid} finalized | Duration: {duration}s | Sentiment: {analysis['user_sentiment']}")
 
+        # Mark as finalized BEFORE webhook delivery so StatusCallback doesn't duplicate
+        finalized_calls.add(call_sid)
+
         # POST to webhook if provided (for n8n integration)
         if webhook_url:
             await _send_webhook(call_sid, result, webhook_url)
@@ -596,6 +606,9 @@ async def _finalize_call(call_sid: str, webhook_url: str):
         if webhook_url:
             print(f"🔧 Sending fallback result to webhook for {call_sid}")
             await _send_webhook(call_sid, fallback_result, webhook_url)
+
+        # Mark as finalized even on error (we attempted webhook delivery)
+        finalized_calls.add(call_sid)
 
     finally:
         # Clean up conversation history (keep results for GET /call/{id})
